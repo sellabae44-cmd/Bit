@@ -2340,6 +2340,27 @@ def build_strength_bar(ton_amt: float) -> str:
     wall = "\n".join(lines)
     return wall + "\n\n"
 
+
+def build_strength_line(ton_amt: float) -> str:
+    """Return a single-line green strength wall (compact).
+
+    The user wants the alert not to be too long, so we use one line.
+    We still vary slightly by TON size, but cap for consistency.
+    """
+    try:
+        t = float(ton_amt or 0.0)
+    except Exception:
+        t = 0.0
+
+    # Simple tiers (single line)
+    if t < 2:
+        n = 12
+    elif t < 5:
+        n = 16
+    else:
+        n = 21
+    return "🟢" * n + "\n\n"
+
 # ===================== MESSAGE SENDER =====================
 async def post_buy_message(
     context: ContextTypes.DEFAULT_TYPE,
@@ -2400,43 +2421,53 @@ async def post_buy_message(
 
         dex_label = (lbl or source_label or "DEX").strip() or "DEX"
 
-        # -------- Maxiton-style SpyTON layout (premium, text links) --------
+        # -------- Compact buy layout (user-requested) --------
         token_name = sym
         try:
             if isinstance(rec, dict):
                 token_name = (rec.get("token_name") or sym) or sym
-        except:
+        except Exception:
             token_name = sym
         token_name = str(token_name)
 
         name_safe = html.escape(token_name)
         sym_safe = html.escape(sym)
 
-        name_part = f"<a href='{tg_url}'>{name_safe}</a>" if tg_url else name_safe
-        sym_part = f"<a href='{tg_url}'>{sym_safe}</a>" if tg_url else sym_safe
+        # Title line: "| VanGogh Buy!"
+        title_line = f"| <b>{name_safe} Buy!</b>\n\n"
 
-        header_line = f"🟩 | {name_part}\n\n"
-        title_line = f"{sym_part} Buy! — {html.escape(dex_label)}\n"
+        # Strength wall (single line)
+        strength = build_strength_line(ton_amt) if ton_amt > 0 else ""
 
         # Amount lines
-        ton_line = f"💎 <b>{ton_amt:.2f} TON</b>{usd_part}\n" if ton_amt > 0 else ""
+        usd_inline = f" (${usd_val:,.2f})" if usd_val else ""
+        ton_line = f"💎 {ton_amt:,.2f} TON{usd_inline}\n" if ton_amt > 0 else ""
 
         token_amt_txt = ""
         if token_amt and token_amt > 0:
-            if token_amt >= 1000:
+            if token_amt >= 1_000_000:
                 token_amt_txt = f"{token_amt:,.0f}"
             elif token_amt >= 1:
                 token_amt_txt = f"{token_amt:,.2f}"
             else:
                 token_amt_txt = f"{token_amt:,.6f}".rstrip("0").rstrip(".")
-        token_line = f"🪙 <b>{token_amt_txt} {sym_safe}</b>\n" if token_amt_txt else ""
+        # Prefer token name on this line (matches your example)
+        token_line = f"🪙 {token_amt_txt} {name_safe}\n\n" if token_amt_txt else "\n"
 
-        buyer_part = f"<a href='{buyer_url}'>{short(buyer)}</a>" if buyer_url else short(buyer)
+        buyer_short = short(buyer)
         txn_part = f"<a href='{tx_url}'>Txn</a>" if tx_url else "Txn"
-        wallet_line = f"👤 {buyer_part} | {txn_part}\n"
+        pos_inline = f": {html.escape(pos_txt)}" if (pos_txt or "").strip() else ""
+        wallet_line = f"👤 {buyer_short}{pos_inline} | {txn_part}\n"
+
+        holders_val_plain = f"{holders_count:,}" if isinstance(holders_count, int) else "N/A"
+        holders_line_plain = f"👥 Holders: {holders_val_plain}\n"
 
         # DTrade deep-link: referral prefix + CA (token address)
-        dtrade_url = f"https://t.me/{DTRADE_BOT_USERNAME}?start={DTRADE_START_PREFIX}{token_addr}" if token_addr else f"https://t.me/{DTRADE_BOT_USERNAME}"
+        dtrade_url = (
+            f"https://t.me/{DTRADE_BOT_USERNAME}?start={DTRADE_START_PREFIX}{token_addr}"
+            if token_addr
+            else f"https://t.me/{DTRADE_BOT_USERNAME}"
+        )
 
         links_line = (
             f"📈 <a href='{chart_url}'>Chart</a> | "
@@ -2445,20 +2476,18 @@ async def post_buy_message(
         )
 
         text = (
-            f"{header_line}"
             f"{title_line}"
-            f"{build_strength_bar(ton_amt)}"
+            f"{strength}"
             f"{ton_line}"
             f"{token_line}"
             f"{wallet_line}"
-            f"{holders_line}"
-            f"💧 Liquidity: <b>{liq_txt}</b>\n"
-            f"📊 MCap: <b>{mc_txt}</b>\n"
+            f"{holders_line_plain}"
+            f"💧 Liquidity: {liq_txt}\n"
+            f"📊 MCap: {mc_txt}\n\n"
             f"{links_line}"
             f"\nad: {build_ad_line()}"
         )
-
-# GROUP STYLE (exact template user wants)
+        # GROUP STYLE (for group mirrors - compact)
         dex_lbl_plain = (lbl or source_label or "DEX").strip() or "DEX"
         grp_pos = "New!" if "new" in (pos_txt or "").lower() else "Old!"
         price_val = stats.get("price_usd")
