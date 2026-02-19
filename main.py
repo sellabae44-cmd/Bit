@@ -606,6 +606,74 @@ def build_ad_line() -> str:
     return txt
 
 
+# ===================== PAIR -> JETTON ADDRESS RESOLUTION =====================
+# Some pools in data.json may be missing token_address. When that happens, holders
+# will show N/A. We resolve the jetton address from the DexScreener pair endpoint
+# (non-TON leg) and cache it.
+
+PAIR_JETTON_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _pair_jetton_cache_get(pair_id: str, ttl: int = 6 * 3600) -> Optional[str]:
+    now = time.time()
+    c = PAIR_JETTON_CACHE.get(pair_id)
+    if isinstance(c, dict) and (now - float(c.get("_ts", 0))) < ttl:
+        v = (c.get("jetton") or "").strip()
+        return v or None
+    return None
+
+
+def resolve_jetton_from_pair(pair_id: str) -> Optional[str]:
+    """Return the non-TON token address for a TON pair (best-effort).
+
+    Uses DexScreener pair endpoint: /latest/dex/pairs/ton/{pair_id}
+    """
+    if not pair_id:
+        return None
+
+    cached = _pair_jetton_cache_get(pair_id)
+    if cached:
+        return cached
+
+    jetton_addr = None
+    try:
+        url = f"{DEX_PAIR_URL}/{pair_id}"
+        res = requests.get(url, timeout=15)
+        if res.status_code != 200:
+            PAIR_JETTON_CACHE[pair_id] = {"jetton": None, "_ts": time.time()}
+            return None
+        js = res.json()
+        pairs = js.get("pairs") if isinstance(js, dict) else None
+        if not isinstance(pairs, list) or not pairs or not isinstance(pairs[0], dict):
+            PAIR_JETTON_CACHE[pair_id] = {"jetton": None, "_ts": time.time()}
+            return None
+
+        p0 = pairs[0]
+        base = p0.get("baseToken") or {}
+        quote = p0.get("quoteToken") or {}
+        base_sym = (base.get("symbol") or "").upper()
+        quote_sym = (quote.get("symbol") or "").upper()
+
+        # DexScreener usually provides 'address'
+        base_addr = (base.get("address") or base.get("tokenAddress") or base.get("addr") or "").strip()
+        quote_addr = (quote.get("address") or quote.get("tokenAddress") or quote.get("addr") or "").strip()
+
+        # Pick the non-TON leg
+        if base_sym == "TON" and quote_addr:
+            jetton_addr = quote_addr
+        elif quote_sym == "TON" and base_addr:
+            jetton_addr = base_addr
+        else:
+            # If symbols are weird/missing, fallback to whichever address looks non-empty
+            jetton_addr = base_addr or quote_addr or None
+
+    except Exception:
+        jetton_addr = None
+
+    PAIR_JETTON_CACHE[pair_id] = {"jetton": jetton_addr, "_ts": time.time()}
+    return jetton_addr
+
+
 def set_active_ad(text: str, url: Optional[str], duration_seconds: Optional[int]):
     """Set active ad. duration_seconds None => 24h; <=0 => never expire."""
     load_ads()
@@ -2285,6 +2353,22 @@ async def post_buy_message(
     pos_txt: str,
     source_label: str = "DEX",
 ):
+    # Resolve token address when missing (needed for holders + better links)
+    # Some tracked pools may not include token_address in data.json.
+    if (not token_addr) and pair_id:
+        resolved = resolve_jetton_from_pair(pair_id)
+        if resolved:
+            token_addr = resolved
+            # Persist for future runs so we don't need to resolve again
+            try:
+                load_data()
+                rec_tmp = DATA.get("pairs", {}).get(pair_id)
+                if isinstance(rec_tmp, dict) and not (rec_tmp.get("token_address") or "").strip():
+                    rec_tmp["token_address"] = token_addr
+                    save_data()
+            except Exception:
+                pass
+
     # Build links early (no network)
     chart_url = f"https://www.geckoterminal.com/ton/tokens/{token_addr}" if token_addr else f"https://dexscreener.com/ton/{pair_id}"
     pools_url = f"https://dexscreener.com/ton/{pair_id}"
@@ -2369,9 +2453,9 @@ async def post_buy_message(
             f"{wallet_line}"
             f"{holders_line}"
             f"💧 Liquidity: <b>{liq_txt}</b>\n"
-            f"📊 MCap: <b>{mc_txt}</b>\n\n"
+            f"📊 MCap: <b>{mc_txt}</b>\n"
             f"{links_line}"
-            f"\n\nad: {build_ad_line()}"
+            f"\nad: {build_ad_line()}"
         )
 
 # GROUP STYLE (exact template user wants)
