@@ -95,6 +95,14 @@ ICON_POOLS_ID   = os.getenv("ICON_POOLS_ID", "").strip()
 
 TONAPI_KEY = os.getenv("TONAPI_KEY", "")
 TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io")
+# Normalize common misconfiguration where users set TONAPI_BASE to .../v2
+try:
+    _tb = (TONAPI_BASE or "").strip().rstrip("/")
+    if _tb.lower().endswith("/v2"):
+        _tb = _tb[:-3]
+    TONAPI_BASE = _tb or "https://tonapi.io"
+except Exception:
+    TONAPI_BASE = "https://tonapi.io"
 
 DEDUST_ENABLED = os.getenv("DEDUST_ENABLED", "1") == "1"
 DEDUST_POLL_LIMIT = int(os.getenv("DEDUST_POLL_LIMIT", "50"))
@@ -2408,6 +2416,22 @@ async def post_buy_message(
                 tg_url = w.get("telegram")
                 break
 
+    # If still missing, try DexScreener socials (best-effort) so token name/symbol becomes clickable.
+    if not tg_url and token_addr:
+        try:
+            tg_found = fetch_token_telegram_url_from_dexscreener(token_addr)
+            if tg_found:
+                tg_url = tg_found
+                # persist for future
+                try:
+                    if isinstance(rec, dict):
+                        rec["telegram"] = tg_found
+                        save_data()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     # Compose function so we can send fast then edit later
     def _compose(ton_usd_val: float, stats: Dict[str, Any], holders_count: Optional[int]) -> Tuple[str, str]:
         usd_val = ton_amt * ton_usd_val if ton_usd_val > 0 and ton_amt > 0 else 0.0
@@ -2433,8 +2457,13 @@ async def post_buy_message(
         name_safe = html.escape(token_name)
         sym_safe = html.escape(sym)
 
-        # Title line: "| VanGogh Buy!"
-        title_line = f"| <b>{name_safe} Buy!</b>\n\n"
+        # Title line: "| VanGogh Buy!" (token clickable to Telegram if available)
+        # If we have a Telegram link for the token, make the token name clickable.
+        if tg_url and isinstance(tg_url, str) and tg_url.startswith("http"):
+            title_tok = f"<a href='{html.escape(tg_url, quote=True)}'><b>{name_safe}</b></a>"
+        else:
+            title_tok = f"<b>{name_safe}</b>"
+        title_line = f"| {title_tok} Buy!\n\n"
 
         # Strength wall (single line)
         strength = build_strength_line(ton_amt) if ton_amt > 0 else ""
@@ -2452,12 +2481,23 @@ async def post_buy_message(
             else:
                 token_amt_txt = f"{token_amt:,.6f}".rstrip("0").rstrip(".")
         # Prefer token name on this line (matches your example)
-        token_line = f"🪙 {token_amt_txt} {name_safe}\n\n" if token_amt_txt else "\n"
+        # Token amount line: make the symbol/name clickable to Telegram if present
+        if tg_url and isinstance(tg_url, str) and tg_url.startswith("http"):
+            tok_click = f"<a href='{html.escape(tg_url, quote=True)}'>{name_safe}</a>"
+        else:
+            tok_click = name_safe
+        token_line = f"🪙 {token_amt_txt} {tok_click}\n\n" if token_amt_txt else "\n"
 
         buyer_short = short(buyer)
+        # Buyer wallet clickable (Tonviewer)
+        buyer_part = (
+            f"<a href='{html.escape(buyer_url, quote=True)}'>{html.escape(buyer_short)}</a>"
+            if buyer_url
+            else html.escape(buyer_short)
+        )
         txn_part = f"<a href='{tx_url}'>Txn</a>" if tx_url else "Txn"
         pos_inline = f": {html.escape(pos_txt)}" if (pos_txt or "").strip() else ""
-        wallet_line = f"👤 {buyer_short}{pos_inline} | {txn_part}\n"
+        wallet_line = f"👤 {buyer_part}{pos_inline} | {txn_part}\n"
 
         holders_val_plain = f"{holders_count:,}" if isinstance(holders_count, int) else "N/A"
         holders_line_plain = f"👥 Holders: {holders_val_plain}\n"
