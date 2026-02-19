@@ -163,6 +163,14 @@ DEX_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens"
 DATA_FILE = "data.json"
 STATE_FILE = "state.json"
 
+# -------------------- ADS (Sponsor slot) --------------------
+ADS_FILE = os.getenv("ADS_FILE", "ads.json")
+DEFAULT_AD_TEXT = (os.getenv("DEFAULT_AD_TEXT", "Buy ads on SpyTON — DM @Vseeton") or "").strip()
+DEFAULT_AD_URL = (os.getenv("DEFAULT_AD_URL", "https://t.me/Vseeton") or "").strip()
+
+ADS: Dict[str, Any] = {"active": None}  # {"text": str, "url": str|None, "expires_at": float}
+
+
 # -------------------- RUNTIME --------------------
 LAST_HTTP_INFO: str = "No requests yet"
 LAST_EVENTS_COUNT: int = 0
@@ -536,6 +544,87 @@ AUTO_RANK_TTL = int(os.getenv("AUTO_RANK_TTL", "30"))  # seconds
 
 def save_state():
     _atomic_write(STATE_FILE, json.dumps(STATE, ensure_ascii=False, indent=2))
+
+
+# -------------------- ADS HELPERS --------------------
+def load_ads():
+    global ADS
+    try:
+        with open(ADS_FILE, "r", encoding="utf-8") as f:
+            a = json.load(f)
+        if isinstance(a, dict):
+            ADS.update(a)
+        if "active" not in ADS:
+            ADS["active"] = None
+    except:
+        ADS = {"active": None}
+
+def save_ads():
+    _atomic_write(ADS_FILE, json.dumps(ADS, ensure_ascii=False, indent=2))
+
+def _parse_duration_to_seconds(raw: str) -> Optional[int]:
+    """Parse durations like 30m, 6h, 2d, 1w. Returns seconds or None."""
+    if not raw:
+        return None
+    s = str(raw).strip().lower()
+    if s in ("forever", "perm", "permanent"):
+        return 10 * 365 * 24 * 3600  # 10 years
+    if s.isdigit():
+        # assume hours if plain integer
+        return int(s) * 3600
+    m = re.match(r"^([0-9]+)\s*([smhdw])$", s)
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2)
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}.get(unit, 3600)
+    return n * mult
+
+def get_active_ad(now: Optional[float] = None) -> Dict[str, Any]:
+    """Returns dict with keys: text, url, expires_at, active(bool)."""
+    load_ads()
+    now = now if now is not None else time.time()
+    a = ADS.get("active")
+    if isinstance(a, dict):
+        exp = float(a.get("expires_at") or 0)
+        txt = (a.get("text") or "").strip()
+        url = (a.get("url") or "").strip() or None
+        if txt and (exp <= 0 or now < exp):
+            return {"active": True, "text": txt, "url": url, "expires_at": exp}
+    # fallback default
+    txt = (DEFAULT_AD_TEXT or "").strip()
+    url = (DEFAULT_AD_URL or "").strip() or None
+    return {"active": False, "text": txt, "url": url, "expires_at": 0.0}
+
+def build_ad_line() -> str:
+    a = get_active_ad()
+    txt = html.escape(str(a.get('text') or '').strip())
+    url = (a.get('url') or '').strip()
+    if url:
+        u = html.escape(url, quote=True)
+        return f"<a href='{u}'>{txt}</a>"
+    return txt
+
+
+def set_active_ad(text: str, url: Optional[str], duration_seconds: Optional[int]):
+    """Set active ad. duration_seconds None => 24h; <=0 => never expire."""
+    load_ads()
+    txt = (text or "").strip()
+    if not txt:
+        raise ValueError("Empty ad text.")
+    u = (url or "").strip() or None
+    now = time.time()
+    if duration_seconds is None:
+        duration_seconds = 24 * 3600
+    expires_at = 0.0 if duration_seconds <= 0 else now + float(duration_seconds)
+    ADS["active"] = {"text": txt, "url": u, "expires_at": expires_at, "set_at": now}
+    save_ads()
+
+def clear_active_ad():
+    load_ads()
+    ADS["active"] = None
+    save_ads()
+
 
 def cleanup_seen():
     now = time.time()
@@ -2282,6 +2371,7 @@ async def post_buy_message(
             f"💧 Liquidity: <b>{liq_txt}</b>\n"
             f"📊 MCap: <b>{mc_txt}</b>\n\n"
             f"{links_line}"
+            f"\n\nad: {build_ad_line()}"
         )
 
 # GROUP STYLE (exact template user wants)
@@ -3584,6 +3674,97 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True
     )
 
+
+# ===================== ADS COMMANDS (ADMIN ONLY) =====================
+async def adset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage:
+    /adset 24h | Your ad text | https://link
+    /adset 6h Your ad text https://link
+    """
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid):
+        return
+
+    raw = (update.message.text or "")
+    raw_args = raw.split(" ", 1)[1].strip() if " " in raw else ""
+    if not raw_args:
+        await update.message.reply_text("Usage: /adset 24h | Your ad text | https://link (link optional)\nExample: /adset 24h | Buy ads on SpyTON — DM @Vseeton | https://t.me/Vseeton")
+        return
+
+    duration_s: Optional[int] = None
+
+    duration_s: Optional[int] = None
+    ad_text: str = ""
+    ad_url: Optional[str] = None
+
+    if "|" in raw_args:
+        parts = [p.strip() for p in raw_args.split("|")]
+        # duration | text | url(optional)
+        duration_s = _parse_duration_to_seconds(parts[0]) if parts else None
+        ad_text = parts[1] if len(parts) >= 2 else ""
+        ad_url = parts[2] if len(parts) >= 3 else None
+    else:
+        toks = raw_args.split()
+        if len(toks) >= 2:
+            duration_s = _parse_duration_to_seconds(toks[0])
+            rest = toks[1:]
+            # if last token looks like a link, treat as url
+            if rest and (rest[-1].startswith("http://") or rest[-1].startswith("https://") or rest[-1].startswith("t.me/")):
+                ad_url = rest[-1]
+                rest = rest[:-1]
+            ad_text = " ".join(rest).strip()
+        else:
+            duration_s = None
+            ad_text = raw_args.strip()
+
+    if duration_s is None:
+        await update.message.reply_text("❌ Invalid duration. Use like 30m, 6h, 2d, 1w or 'forever'.")
+        return
+    if not ad_text:
+        await update.message.reply_text("❌ Missing ad text.")
+        return
+
+    # Normalize t.me links
+    if ad_url and ad_url.startswith("t.me/"):
+        ad_url = "https://" + ad_url
+
+    try:
+        set_active_ad(ad_text, ad_url, duration_s)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to set ad: {e}")
+        return
+
+    a = get_active_ad()
+    exp = a.get("expires_at") or 0
+    if exp and exp > 0:
+        left = int(exp - time.time())
+        await update.message.reply_text(f"✅ Ad set for ~{left//3600}h {((left%3600)//60)}m.\nAd: {ad_text}")
+    else:
+        await update.message.reply_text(f"✅ Ad set (no expiry).\nAd: {ad_text}")
+
+async def adclear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid):
+        return
+    clear_active_ad()
+    await update.message.reply_text("✅ Sponsor ad cleared. Default ad line will show.")
+
+async def adstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid):
+        return
+    a = get_active_ad()
+    if a.get("active"):
+        exp = a.get("expires_at") or 0
+        if exp and exp > 0:
+            left = int(exp - time.time())
+            await update.message.reply_text(f"📢 Active ad:\nText: {a.get('text')}\nLink: {a.get('url') or '—'}\nExpires in: {left//3600}h {((left%3600)//60)}m")
+        else:
+            await update.message.reply_text(f"📢 Active ad (no expiry):\nText: {a.get('text')}\nLink: {a.get('url') or '—'}")
+    else:
+        await update.message.reply_text(f"ℹ️ No active sponsor. Default ad line:\nText: {a.get('text')}\nLink: {a.get('url') or '—'}")
+
+
 # ===================== MAIN =====================
 
 # ===================== JOBS =====================
@@ -3959,6 +4140,7 @@ def main():
         try:
             load_data()
             load_state()
+            load_ads()
 
             bot = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -3985,6 +4167,9 @@ def main():
             bot.add_handler(CommandHandler("listpair", listpairs))
             bot.add_handler(CommandHandler("setleaderboard", setleaderboard))
             bot.add_handler(CommandHandler("status", status))
+            bot.add_handler(CommandHandler("adset", adset))
+            bot.add_handler(CommandHandler("adclear", adclear))
+            bot.add_handler(CommandHandler("adstatus", adstatus))
 
             # Warm TON price cache (so posts are instant)
             bot.job_queue.run_repeating(ton_price_cache_job, interval=60, first=1)
